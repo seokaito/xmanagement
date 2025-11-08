@@ -8,6 +8,11 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 
+# ✅ Renderのヘルスチェック用トップページ
+@app.route("/")
+def home():
+    return "Flask backend is running successfully!"
+
 # Models
 class Employee(db.Model):
     __tablename__ = 'employees'
