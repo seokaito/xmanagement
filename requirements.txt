@@ -1,0 +1,8 @@
+flask
+flask_sqlalchemy
+psycopg2-binary
+gunicorn
+python-dotenv
+# もしマイグレーション使うなら
+Flask-Migrate
+alembic
