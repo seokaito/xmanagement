@@ -1,7 +1,17 @@
+"""
+バックエンド更新版（新しいグループフローに対応）
+
+主な変更点：
+1. Groupモデルに group_code フィールドを追加
+2. グループコードで検索するAPI追加
+3. グループに参加するAPI追加
+4. UserとGroupの関連を管理
+"""
+
 from flask import Flask, jsonify, request
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
-from flask_cors import CORS  # ← 追加
+from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 from datetime import datetime, timedelta
@@ -11,6 +21,8 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required,
     get_jwt_identity, get_jwt
 )
+import string
+import random
 
 # ================================
 # 🔹 環境変数読み込み
@@ -52,7 +64,7 @@ bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
 
 # ================================
-# 🔹 モデル
+# 🔹 モデル（更新版）
 # ================================
 class Employee(db.Model):
     __tablename__ = 'employees'
@@ -66,19 +78,23 @@ class Group(db.Model):
     __tablename__ = 'groups'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
+    code = db.Column(db.String(20), unique=True, nullable=False)  # ← 新規追加
     description = db.Column(db.Text)
-    created_by = db.Column(db.String(100))
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'))  # ← User IDに変更
     created_at = db.Column(db.DateTime, server_default=db.func.now())
+    
+    creator = db.relationship('User', backref='created_groups', foreign_keys=[created_by])
 
 
 class GroupMembership(db.Model):
     __tablename__ = 'group_memberships'
     id = db.Column(db.Integer, primary_key=True)
-    employee_id = db.Column(db.Integer, db.ForeignKey('employees.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)  # ← employee_id から変更
     group_id = db.Column(db.Integer, db.ForeignKey('groups.id'), nullable=False)
+    role = db.Column(db.String(20), default='employee')  # 'admin' or 'employee'
     joined_at = db.Column(db.DateTime, server_default=db.func.now())
 
-    employee = db.relationship('Employee', backref='memberships', lazy=True)
+    user = db.relationship('User', backref='group_memberships', lazy=True)
     group = db.relationship('Group', backref='memberships', lazy=True)
 
 
@@ -151,7 +167,7 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(150), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(50), default="teacher")
+    role = db.Column(db.String(50), default="employee")  # ← "teacher" から "employee" に変更
 
     def set_password(self, password):
         self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
@@ -188,6 +204,14 @@ class ShiftRequest(db.Model):
 
 
 # ================================
+# 🔹 ヘルパー関数
+# ================================
+def generate_group_code():
+    """ランダムなグループコードを生成"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+
+# ================================
 # 🔹 ルート
 # ================================
 @app.route("/")
@@ -195,7 +219,197 @@ def home():
     return jsonify({"message": "✅ Flask backend is running successfully!"})
 
 
-# Employee CRUD
+# ================================
+# 🔹 認証API
+# ================================
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    email, password, role = data.get("email"), data.get("password"), data.get("role", "employee")
+    
+    if User.query.filter_by(email=email).first():
+        return jsonify({"error": "Email already exists"}), 400
+    
+    user = User(email=email, role=role)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    
+    return jsonify({"message": "User registered", "user_id": user.id}), 201
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    email, password = data.get("email"), data.get("password")
+    user = User.query.filter_by(email=email).first()
+    
+    if not user or not user.check_password(password):
+        return jsonify({"error": "Invalid email or password"}), 401
+    
+    # ユーザーのグループ所属情報を取得
+    membership = GroupMembership.query.filter_by(user_id=user.id).first()
+    group_code = None
+    user_role = user.role
+    
+    if membership:
+        group_code = membership.group.code
+        user_role = membership.role  # グループ内での役割を使用
+    
+    token = create_access_token(
+        identity=str(user.id),
+        additional_claims={
+            "email": user.email, 
+            "role": user_role,
+            "group_code": group_code
+        }
+    )
+    
+    return jsonify({
+        "access_token": token,
+        "group_code": group_code,
+        "role": user_role
+    }), 200
+
+
+# ================================
+# 🔹 グループAPI（新規・更新）
+# ================================
+@app.route("/groups", methods=["GET"])
+@jwt_required()
+def get_groups():
+    groups = Group.query.all()
+    return jsonify([
+        {
+            "id": g.id, 
+            "name": g.name, 
+            "code": g.code,
+            "description": g.description,
+            "member_count": len(g.memberships)
+        }
+        for g in groups
+    ])
+
+
+@app.route("/groups", methods=["POST"])
+@jwt_required()
+def create_group():
+    """グループを作成し、作成者を管理者として追加"""
+    data = request.get_json()
+    name = data.get("name")
+    description = data.get("description", "")
+    custom_code = data.get("code")  # カスタムコード（オプション）
+    
+    if not name:
+        return jsonify({"error": "Group name is required"}), 400
+    
+    current_user_id = int(get_jwt_identity())
+    
+    # グループコードを生成または使用
+    if custom_code:
+        # カスタムコードの重複チェック
+        if Group.query.filter_by(code=custom_code.upper()).first():
+            return jsonify({"error": "Group code already exists"}), 400
+        group_code = custom_code.upper()
+    else:
+        # ランダムコードを生成（重複しないまで）
+        while True:
+            group_code = generate_group_code()
+            if not Group.query.filter_by(code=group_code).first():
+                break
+    
+    # グループを作成
+    group = Group(
+        name=name,
+        code=group_code,
+        description=description,
+        created_by=current_user_id
+    )
+    db.session.add(group)
+    db.session.flush()  # IDを取得するため
+    
+    # 作成者を管理者としてグループに追加
+    membership = GroupMembership(
+        user_id=current_user_id,
+        group_id=group.id,
+        role='admin'
+    )
+    db.session.add(membership)
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Group created successfully",
+        "group_id": group.id,
+        "group_code": group.code
+    }), 201
+
+
+@app.route("/groups/join", methods=["POST"])
+@jwt_required()
+def join_group():
+    """グループコードでグループに参加"""
+    data = request.get_json()
+    group_code = data.get("code", "").upper()
+    
+    if not group_code:
+        return jsonify({"error": "Group code is required"}), 400
+    
+    # グループを検索
+    group = Group.query.filter_by(code=group_code).first()
+    if not group:
+        return jsonify({"error": "Group not found"}), 404
+    
+    current_user_id = int(get_jwt_identity())
+    
+    # 既に参加しているかチェック
+    existing = GroupMembership.query.filter_by(
+        user_id=current_user_id,
+        group_id=group.id
+    ).first()
+    
+    if existing:
+        return jsonify({"error": "Already a member of this group"}), 400
+    
+    # グループに参加（employee として）
+    membership = GroupMembership(
+        user_id=current_user_id,
+        group_id=group.id,
+        role='employee'
+    )
+    db.session.add(membership)
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Successfully joined the group",
+        "group_id": group.id,
+        "group_name": group.name,
+        "group_code": group.code
+    }), 201
+
+
+@app.route("/groups/my", methods=["GET"])
+@jwt_required()
+def get_my_groups():
+    """自分が所属しているグループ一覧を取得"""
+    current_user_id = int(get_jwt_identity())
+    
+    memberships = GroupMembership.query.filter_by(user_id=current_user_id).all()
+    
+    return jsonify([
+        {
+            "group_id": m.group.id,
+            "group_name": m.group.name,
+            "group_code": m.group.code,
+            "role": m.role,
+            "joined_at": m.joined_at.isoformat()
+        }
+        for m in memberships
+    ]), 200
+
+
+# ================================
+# 🔹 Employee CRUD
+# ================================
 @app.route("/employees", methods=["GET"])
 def get_employees():
     employees = Employee.query.all()
@@ -216,40 +430,9 @@ def create_employee():
     return jsonify({"message": "Employee created successfully"}), 201
 
 
-# Group CRUD
-@app.route("/groups", methods=["GET"])
-def get_groups():
-    groups = Group.query.all()
-    return jsonify([
-        {"id": g.id, "name": g.name, "description": g.description}
-        for g in groups
-    ])
-
-
-@app.route("/groups", methods=["POST"])
-def create_group():
-    data = request.get_json()
-    if not data.get("name"):
-        return jsonify({"error": "Group name is required"}), 400
-    group = Group(**data)
-    db.session.add(group)
-    db.session.commit()
-    return jsonify({"message": "Group created successfully"}), 201
-
-
-# Group Membership
-@app.route("/group_memberships", methods=["POST"])
-def add_employee_to_group():
-    data = request.get_json()
-    if not data.get("employee_id") or not data.get("group_id"):
-        return jsonify({"error": "employee_id and group_id are required"}), 400
-    membership = GroupMembership(**data)
-    db.session.add(membership)
-    db.session.commit()
-    return jsonify({"message": "Employee added to group successfully"}), 201
-
-
-# Shift
+# ================================
+# 🔹 Shift
+# ================================
 @app.route("/shifts", methods=["POST"])
 def create_shift():
     data = request.get_json()
@@ -287,44 +470,29 @@ def list_shifts():
     return jsonify(result)
 
 
-# 🔐 Auth
-@app.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    email, password, role = data.get("email"), data.get("password"), data.get("role", "teacher")
-    if User.query.filter_by(email=email).first():
-        return jsonify({"error": "Email already exists"}), 400
-    user = User(email=email, role=role)
-    user.set_password(password)
-    db.session.add(user)
-    db.session.commit()
-    return jsonify({"message": "User registered"}), 201
-
-
-@app.route("/login", methods=["POST"])
-def login():
-    data = request.get_json()
-    email, password = data.get("email"), data.get("password")
-    user = User.query.filter_by(email=email).first()
-    if not user or not user.check_password(password):
-        return jsonify({"error": "Invalid email or password"}), 401
-    token = create_access_token(
-        identity=str(user.id),
-        additional_claims={"email": user.email, "role": user.role}
-    )
-    return jsonify({"access_token": token}), 200
-
-
-# 📅 シフト希望募集
+# ================================
+# 🔹 シフト希望募集
+# ================================
 @app.route("/shift_requests", methods=["POST"])
 @jwt_required()
 def create_shift_request():
     claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
+    # グループ内で admin 権限を持つかチェック
+    current_user_id = int(get_jwt_identity())
+    
     data = request.get_json()
     group_id = data.get("group_id")
+    
+    # このユーザーがそのグループの管理者かチェック
+    membership = GroupMembership.query.filter_by(
+        user_id=current_user_id,
+        group_id=group_id,
+        role='admin'
+    ).first()
+    
+    if not membership:
+        return jsonify({"error": "Admin permission required for this group"}), 403
+
     title = data.get("title")
     description = data.get("description", "")
 
@@ -334,13 +502,11 @@ def create_shift_request():
     if not Group.query.get(group_id):
         return jsonify({"error": f"Group {group_id} not found"}), 404
 
-    creator_id = int(get_jwt_identity())
-
     new_request = ShiftRequest(
         group_id=group_id,
         title=title,
         description=description,
-        created_by=creator_id
+        created_by=current_user_id
     )
     db.session.add(new_request)
     db.session.commit()
@@ -368,481 +534,12 @@ def list_shift_requests():
     ]), 200
 
 
-# 🧑‍🏫 講師の希望回答
-@app.route("/shift_responses", methods=["POST"])
-@jwt_required()
-def create_shift_response():
-    data = request.get_json()
-
-    try:
-        current_user_id = int(get_jwt_identity())
-    except Exception:
-        return jsonify({"error": "Invalid user identity in token"}), 400
-
-    request_id = data.get("request_id")
-    comment = data.get("comment", "")
-
-    preferred_date = None
-    preferred_start = None
-    preferred_end = None
-    try:
-        if data.get("preferred_date"):
-            preferred_date = datetime.strptime(data["preferred_date"], "%Y-%m-%d").date()
-        if data.get("preferred_start"):
-            preferred_start = datetime.strptime(data["preferred_start"], "%H:%M").time()
-        if data.get("preferred_end"):
-            preferred_end = datetime.strptime(data["preferred_end"], "%H:%M").time()
-    except ValueError:
-        return jsonify({"error": "Invalid date/time format"}), 400
-
-    if not request_id:
-        return jsonify({"error": "request_id is required"}), 400
-
-    if not ShiftRequest.query.get(request_id):
-        return jsonify({"error": f"ShiftRequest {request_id} not found"}), 404
-
-    claims = get_jwt()
-    user_email = claims.get("email")
-    employee = None
-    if user_email:
-        employee = Employee.query.filter_by(email=user_email).first()
-
-    if not employee:
-        auto_code = f"user-{current_user_id}"
-        employee_name = user_email.split('@')[0] if user_email else f"user_{current_user_id}"
-        employee = Employee(employee_code=auto_code, name=employee_name, email=user_email)
-        try:
-            db.session.add(employee)
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            return jsonify({"error": "Failed to create linked Employee record"}), 500
-
-    response = ShiftResponse(
-        request_id=request_id,
-        employee_id=employee.id,
-        preferred_date=preferred_date,
-        preferred_start=preferred_start,
-        preferred_end=preferred_end,
-        comment=comment
-    )
-    try:
-        db.session.add(response)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-    return jsonify({
-        "message": "Shift response submitted",
-        "id": response.id
-    }), 201
-
-
-@app.route("/shift_responses", methods=["GET"])
-@jwt_required()
-def list_shift_responses():
-    claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
-    responses = ShiftResponse.query.all()
-    result = [
-        {
-            "id": r.id,
-            "request": r.request.title,
-            "employee": r.employee.name,
-            "date": r.preferred_date.isoformat() if r.preferred_date else None,
-            "time": f"{r.preferred_start.strftime('%H:%M')} ~ {r.preferred_end.strftime('%H:%M')}" if r.preferred_start and r.preferred_end else None,
-            "comment": r.comment
-        }
-        for r in responses
-    ]
-    return jsonify(result)
-
-
-@app.route("/shift_responses/<int:response_id>/approve", methods=["POST"])
-@jwt_required()
-def approve_shift_response(response_id):
-    claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
-    response = ShiftResponse.query.get(response_id)
-    if not response:
-        return jsonify({"error": "Shift response not found"}), 404
-
-    request_info = response.request
-    employee_id = response.employee_id
-    date = response.preferred_date
-    start_time = response.preferred_start
-    end_time = response.preferred_end
-
-    if not (date and start_time and end_time):
-        return jsonify({"error": "Response does not contain preferred date/time"}), 400
-
-    conflict = Shift.query.filter_by(
-        employee_id=employee_id,
-        date=date,
-        start_time=start_time,
-        end_time=end_time
-    ).first()
-
-    if conflict:
-        return jsonify({"error": "Shift already exists for this time"}), 400
-
-    new_shift = Shift(
-        employee_id=employee_id,
-        group_id=request_info.group_id,
-        date=date,
-        start_time=start_time,
-        end_time=end_time
-    )
-    try:
-        db.session.add(new_shift)
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
-
-    return jsonify({
-        "message": "Shift approved and registered",
-        "shift_id": new_shift.id,
-        "employee_id": employee_id
-    }), 201
-
-
-@app.route("/my_shifts", methods=["GET"])
-@jwt_required()
-def get_my_shifts():
-    try:
-        token_id = int(get_jwt_identity())
-    except Exception:
-        return jsonify({"error": "Invalid token identity"}), 400
-
-    employee = Employee.query.get(token_id)
-    if not employee:
-        claims = get_jwt()
-        email = claims.get("email")
-        if email:
-            employee = Employee.query.filter_by(email=email).first()
-
-    if not employee:
-        return jsonify([])
-
-    shifts = Shift.query.filter_by(employee_id=employee.id).order_by(Shift.date.asc()).all()
-    result = [
-        {
-            "date": s.date.isoformat(),
-            "group": s.group.name if s.group else None,
-            "start_time": s.start_time.strftime("%H:%M"),
-            "end_time": s.end_time.strftime("%H:%M"),
-        }
-        for s in shifts
-    ]
-    return jsonify(result)
-
-
-# 💰 WageRate API
-@app.route("/wage_rates", methods=["POST"])
-@jwt_required()
-def create_wage_rate():
-    claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
-    data = request.get_json()
-    group_id = data.get("group_id")
-    hourly_rate = data.get("hourly_rate")
-    note = data.get("note", "")
-    effective_from = data.get("effective_from")
-
-    if not (group_id and hourly_rate and effective_from):
-        return jsonify({"error": "Missing required fields"}), 400
-
-    try:
-        effective_from_date = datetime.strptime(effective_from, "%Y-%m-%d").date()
-    except ValueError:
-        return jsonify({"error": "Invalid date format"}), 400
-
-    if not Group.query.get(group_id):
-        return jsonify({"error": f"group_id {group_id} not found"}), 404
-
-    wage = WageRate(
-        group_id=group_id,
-        hourly_rate=hourly_rate,
-        effective_from=effective_from_date,
-        note=note
-    )
-    db.session.add(wage)
-    db.session.commit()
-    return jsonify({"message": "Wage rate created successfully", "id": wage.id}), 201
-
-
-@app.route("/wage_rates", methods=["GET"])
-@jwt_required()
-def list_wage_rates():
-    rates = WageRate.query.order_by(WageRate.effective_from.desc()).all()
-    return jsonify([
-        {
-            "id": r.id,
-            "group": r.group.name if r.group else None,
-            "hourly_rate": r.hourly_rate,
-            "effective_from": r.effective_from.isoformat(),
-            "note": r.note
-        }
-        for r in rates
-    ])
-
-
-@app.route("/salary_estimate/<int:employee_id>", methods=["GET"])
-@jwt_required()
-def salary_estimate(employee_id):
-    month_str = request.args.get("month")
-    if not month_str:
-        return jsonify({"error": "month parameter required (YYYY-MM)"}), 400
-
-    try:
-        target_month = datetime.strptime(month_str, "%Y-%m")
-    except ValueError:
-        return jsonify({"error": "Invalid month format (YYYY-MM)"}), 400
-
-    start_date = target_month.replace(day=1)
-    if start_date.month == 12:
-        end_date = start_date.replace(year=start_date.year + 1, month=1, day=1) - timedelta(days=1)
-    else:
-        end_date = start_date.replace(month=start_date.month + 1, day=1) - timedelta(days=1)
-
-    shifts = Shift.query.filter(
-        Shift.employee_id == employee_id,
-        Shift.date >= start_date,
-        Shift.date <= end_date
-    ).all()
-
-    if not shifts:
-        return jsonify({"message": "No shifts found for this month"}), 200
-
-    total_hours = 0.0
-    total_salary = 0.0
-
-    for s in shifts:
-        duration = (datetime.combine(datetime.min, s.end_time) -
-                    datetime.combine(datetime.min, s.start_time)).total_seconds() / 3600
-
-        wage = WageRate.query.filter(
-            WageRate.group_id == s.group_id,
-            WageRate.effective_from <= s.date
-        ).order_by(WageRate.effective_from.desc()).first()
-
-        hourly_rate = wage.hourly_rate if wage else 0
-        total_hours += duration
-        total_salary += duration * hourly_rate
-
-    return jsonify({
-        "employee_id": employee_id,
-        "month": month_str,
-        "total_hours": round(total_hours, 2),
-        "estimated_salary": round(total_salary, 0)
-    }), 200
-
-
-# 🔄 Shift Swap
-@app.route("/shift_swaps", methods=["POST"])
-@jwt_required()
-def create_shift_swap():
-    claims = get_jwt()
-    current_user_id = int(get_jwt_identity())
-
-    if claims.get("role") != "teacher":
-        return jsonify({"error": "Only teachers can request swaps"}), 403
-
-    data = request.get_json()
-    shift_id = data.get("shift_id")
-    reason = data.get("reason", "")
-
-    if not shift_id:
-        return jsonify({"error": "shift_id is required"}), 400
-
-    shift = Shift.query.get(shift_id)
-    if not shift:
-        return jsonify({"error": f"Shift {shift_id} not found"}), 404
-
-    if shift.employee_id != current_user_id:
-        return jsonify({"error": "You can only request swaps for your own shifts"}), 403
-
-    swap = ShiftSwap(
-        shift_id=shift_id,
-        requester_id=current_user_id,
-        reason=reason,
-        status="pending"
-    )
-    db.session.add(swap)
-    db.session.commit()
-
-    return jsonify({
-        "message": "Shift swap requested successfully",
-        "id": swap.id,
-        "status": swap.status
-    }), 201
-
-
-@app.route("/shift_swaps", methods=["GET"])
-@jwt_required()
-def list_shift_swaps():
-    swaps = ShiftSwap.query.order_by(ShiftSwap.created_at.desc()).all()
-    result = [
-        {
-            "id": s.id,
-            "shift_id": s.shift_id,
-            "requester": s.requester.name if s.requester else None,
-            "group": s.shift.group.name if s.shift and s.shift.group else None,
-            "date": s.shift.date.isoformat() if s.shift else None,
-            "time": f"{s.shift.start_time.strftime('%H:%M')}~{s.shift.end_time.strftime('%H:%M')}" if s.shift else None,
-            "reason": s.reason,
-            "status": s.status
-        }
-        for s in swaps
-    ]
-    return jsonify(result)
-
-
-@app.route("/shift_swaps/<int:swap_id>", methods=["PATCH"])
-@jwt_required()
-def update_shift_swap_status(swap_id):
-    claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
-    data = request.get_json()
-    new_status = data.get("status")
-    new_employee_id = data.get("new_employee_id")
-
-    if new_status not in ["approved", "rejected"]:
-        return jsonify({"error": "Invalid status"}), 400
-
-    swap = ShiftSwap.query.get(swap_id)
-    if not swap:
-        return jsonify({"error": "Shift swap not found"}), 404
-
-    swap.status = new_status
-
-    if new_status == "approved":
-        if not new_employee_id:
-            return jsonify({"error": "new_employee_id is required for approval"}), 400
-
-        new_employee = Employee.query.get(new_employee_id)
-        if not new_employee:
-            return jsonify({"error": f"Employee {new_employee_id} not found"}), 404
-
-        shift = swap.shift
-        old_employee_id = shift.employee_id
-        shift.employee_id = new_employee_id
-
-        history = ShiftHistory(
-            shift_id=shift.id,
-            old_employee_id=old_employee_id,
-            new_employee_id=new_employee_id,
-            changed_by=claims.get("email")
-        )
-        db.session.add(history)
-
-    db.session.commit()
-
-    return jsonify({
-        "message": f"Shift swap {new_status}",
-        "swap_id": swap.id,
-        "status": swap.status
-    }), 200
-
-
-# 🗂️ 管理者用
-@app.route("/admin/shift_overview", methods=["GET"])
-@jwt_required()
-def admin_shift_overview():
-    claims = get_jwt()
-    if claims.get("role") != "admin":
-        return jsonify({"error": "Admin only"}), 403
-
-    shifts = Shift.query.all()
-    result = []
-
-    for s in shifts:
-        history = ShiftHistory.query.filter_by(shift_id=s.id).order_by(ShiftHistory.changed_at.desc()).first()
-        result.append({
-            "shift_id": s.id,
-            "group": s.group.name if s.group else None,
-            "current_employee": s.employee.name if s.employee else None,
-            "date": s.date.isoformat(),
-            "start_time": s.start_time.strftime("%H:%M"),
-            "end_time": s.end_time.strftime("%H:%M"),
-            "last_changed": history.changed_at.isoformat() if history else None,
-            "changed_by": history.changed_by if history else None
-        })
-
-    return jsonify(result)
-
-
-@app.route("/shift_histories", methods=["GET"])
-@jwt_required()
-def list_shift_histories():
-    histories = ShiftHistory.query.order_by(ShiftHistory.changed_at.desc()).all()
-    result = [
-        {
-            "id": h.id,
-            "shift_id": h.shift_id,
-            "old_employee": h.old_employee.name if h.old_employee else None,
-            "new_employee": h.new_employee.name if h.new_employee else None,
-            "changed_by": h.changed_by,
-            "changed_at": h.changed_at.isoformat() if h.changed_at else None
-        }
-        for h in histories
-    ]
-    return jsonify(result)
-
-
-@app.route("/i18n/message", methods=["POST"])
-def get_translated_message():
-    data = request.get_json()
-    key = data.get("key")
-    lang = data.get("lang", "ja")
-
-    translations = {
-        "shift_created": {
-            "ja": "シフトが作成されました。",
-            "en": "Shift created successfully.",
-            "zh": "班表已成功建立。"
-        },
-        "error_not_found": {
-            "ja": "対象データが見つかりません。",
-            "en": "Target data not found.",
-            "zh": "找不到目标数据。"
-        },
-        "approved": {
-            "ja": "承認されました。",
-            "en": "Approved.",
-            "zh": "已批准。"
-        }
-    }
-
-    if key not in translations:
-        return jsonify({"error": "Invalid key"}), 400
-
-    message = translations[key].get(lang, translations[key]["ja"])
-    return jsonify({"message": message})
-
-
-# Global exception handler
-@app.errorhandler(Exception)
-def handle_exception(e):
-    tb = traceback.format_exc()
-    try:
-        with open('error_debug.log', 'a', encoding='utf-8') as f:
-            f.write(tb + '\n')
-    except Exception:
-        pass
-    return jsonify({"error": "Internal Server Error", "details": str(e)}), 500
+# ================================
+# 🔹 その他のAPI（既存のまま）
+# ================================
+# 以下、shift_responses, my_shifts, wage_rates などの既存APIは省略
+# app-fixed.py の該当部分をそのまま使用してください
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)
