@@ -1,8 +1,11 @@
 flask
 flask_sqlalchemy
+flask_migrate
 psycopg2-binary
+flask_bcrypt
+flask_jwt_extended
+flask_mail
+flask-cors
+flask-babel
 gunicorn
-python-dotenv
-# もしマイグレーション使うなら
-Flask-Migrate
 alembic
