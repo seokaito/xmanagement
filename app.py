@@ -24,6 +24,10 @@ from flask_jwt_extended import (
 import string
 import random
 
+def generate_group_code():
+    """ランダムなグループコードを生成"""
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
 # ================================
 # 🔹 環境変数読み込み
 # ================================
